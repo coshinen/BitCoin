@@ -1,22 +1,6 @@
-// Copyright (c) 2008 Satoshi Nakamoto
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in
-// all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE, TITLE AND NON-INFRINGEMENT. IN NO EVENT
-// SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
-// OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-// IN THE SOFTWARE.
+// Copyright (c) 2009 Satoshi Nakamoto
+// Distributed under the MIT/X11 software license, see the accompanying
+// file license.txt or http://www.opensource.org/licenses/mit-license.php.
 
 class COutPoint;
 class CInPoint;
@@ -31,25 +15,32 @@ class CWalletTx;
 class CKeyItem;
 
 static const unsigned int MAX_SIZE = 0x02000000;
-static const int64 COIN = 1000000;
-static const int64 CENT = 10000;
-static const int64 TRANSACTIONFEE = 1 * CENT; /// change this to a user options setting, optional fee can be zero
-///static const unsigned int MINPROOFOFWORK = 40; /// need to decide the right difficulty to start with
-static const unsigned int MINPROOFOFWORK = 20;  /// ridiculously easy for testing
+static const int64 COIN = 100000000;
+static const int64 CENT = 1000000;
+static const int COINBASE_MATURITY = 100;
+
+static const CBigNum bnProofOfWorkLimit(~uint256(0) >> 32);
 
 
 
 
 
 
-
+extern CCriticalSection cs_main;
 extern map<uint256, CBlockIndex*> mapBlockIndex;
 extern const uint256 hashGenesisBlock;
 extern CBlockIndex* pindexGenesisBlock;
 extern int nBestHeight;
+extern uint256 hashBestChain;
 extern CBlockIndex* pindexBest;
 extern unsigned int nTransactionsUpdated;
+extern string strSetDataDir;
+extern int nDropMessagesTest;
+
+// Settings
 extern int fGenerateBitcoins;
+extern int64 nTransactionFee;
+extern CAddress addrIncoming;
 
 
 
@@ -57,6 +48,7 @@ extern int fGenerateBitcoins;
 
 
 
+string GetAppDir();
 FILE* OpenBlockFile(unsigned int nFile, unsigned int nBlockPos, const char* pszMode="rb");
 FILE* AppendBlockFile(unsigned int& nFileRet);
 bool AddKey(const CKey& key);
@@ -65,12 +57,14 @@ bool AddToWallet(const CWalletTx& wtxIn);
 void ReacceptWalletTransactions();
 void RelayWalletTransactions();
 bool LoadBlockIndex(bool fAllowNew=true);
+void PrintBlockTree();
 bool BitcoinMiner();
 bool ProcessMessages(CNode* pfrom);
 bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv);
 bool SendMessages(CNode* pto);
-int64 CountMoney();
-bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& txNew);
+int64 GetBalance();
+bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& txNew, int64& nFeeRequiredRet);
+bool CommitTransactionSpent(const CWalletTx& wtxNew);
 bool SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew);
 
 
@@ -118,12 +112,17 @@ public:
         return !(a == b);
     }
 
-    void print() const
+    string ToString() const
     {
         if (IsNull())
-            printf("null");
+            return strprintf("null");
         else
-            printf("(nFile=%d, nBlockPos=%d, nTxPos=%d)", nFile, nBlockPos, nTxPos);
+            return strprintf("(nFile=%d, nBlockPos=%d, nTxPos=%d)", nFile, nBlockPos, nTxPos);
+    }
+
+    void print() const
+    {
+        printf("%s", ToString().c_str());
     }
 };
 
@@ -172,9 +171,14 @@ public:
         return !(a == b);
     }
 
+    string ToString() const
+    {
+        return strprintf("COutPoint(%s, %d)", hash.ToString().substr(0,6).c_str(), n);
+    }
+
     void print() const
     {
-        printf("COutPoint(%s, %d)", hash.ToString().substr(0,6).c_str(), n);
+        printf("%s\n", ToString().c_str());
     }
 };
 
@@ -191,37 +195,44 @@ class CTxIn
 public:
     COutPoint prevout;
     CScript scriptSig;
+    unsigned int nSequence;
 
     CTxIn()
     {
+        nSequence = UINT_MAX;
     }
 
-    CTxIn(COutPoint prevoutIn, CScript scriptSigIn)
+    explicit CTxIn(COutPoint prevoutIn, CScript scriptSigIn=CScript(), unsigned int nSequenceIn=UINT_MAX)
     {
         prevout = prevoutIn;
         scriptSig = scriptSigIn;
+        nSequence = nSequenceIn;
     }
 
-    CTxIn(uint256 hashPrevTx, unsigned int nOut, CScript scriptSigIn)
+    CTxIn(uint256 hashPrevTx, unsigned int nOut, CScript scriptSigIn=CScript(), unsigned int nSequenceIn=UINT_MAX)
     {
         prevout = COutPoint(hashPrevTx, nOut);
         scriptSig = scriptSigIn;
+        nSequence = nSequenceIn;
     }
 
     IMPLEMENT_SERIALIZE
     (
         READWRITE(prevout);
         READWRITE(scriptSig);
+        READWRITE(nSequence);
     )
 
-    bool IsPrevInMainChain() const
+    bool IsFinal() const
     {
-        return CTxDB("r").ContainsTx(prevout.hash);
+        return (nSequence == UINT_MAX);
     }
 
     friend bool operator==(const CTxIn& a, const CTxIn& b)
     {
-        return (a.prevout == b.prevout && a.scriptSig == b.scriptSig);
+        return (a.prevout   == b.prevout &&
+                a.scriptSig == b.scriptSig &&
+                a.nSequence == b.nSequence);
     }
 
     friend bool operator!=(const CTxIn& a, const CTxIn& b)
@@ -229,20 +240,24 @@ public:
         return !(a == b);
     }
 
+    string ToString() const
+    {
+        string str;
+        str += strprintf("CTxIn(");
+        str += prevout.ToString();
+        if (prevout.IsNull())
+            str += strprintf(", coinbase %s", HexStr(scriptSig.begin(), scriptSig.end(), false).c_str());
+        else
+            str += strprintf(", scriptSig=%s", scriptSig.ToString().substr(0,24).c_str());
+        if (nSequence != UINT_MAX)
+            str += strprintf(", nSequence=%u", nSequence);
+        str += ")";
+        return str;
+    }
+
     void print() const
     {
-        printf("CTxIn(");
-        prevout.print();
-        if (prevout.IsNull())
-        {
-            printf(", coinbase %s)\n", HexStr(scriptSig.begin(), scriptSig.end(), false).c_str());
-        }
-        else
-        {
-            if (scriptSig.size() >= 6)
-                printf(", scriptSig=%02x%02x", scriptSig[4], scriptSig[5]);
-            printf(")\n");
-        }
+        printf("%s\n", ToString().c_str());
     }
 
     bool IsMine() const;
@@ -260,40 +275,40 @@ class CTxOut
 {
 public:
     int64 nValue;
-    unsigned int nSequence;
     CScript scriptPubKey;
-
-    // disk only
-    CDiskTxPos posNext;  //// so far this is only used as a flag, nothing uses the location
 
 public:
     CTxOut()
     {
-        nValue = 0;
-        nSequence = UINT_MAX;
+        SetNull();
     }
 
-    CTxOut(int64 nValueIn, CScript scriptPubKeyIn, int nSequenceIn=UINT_MAX)
+    CTxOut(int64 nValueIn, CScript scriptPubKeyIn)
     {
         nValue = nValueIn;
         scriptPubKey = scriptPubKeyIn;
-        nSequence = nSequenceIn;
     }
 
     IMPLEMENT_SERIALIZE
     (
         READWRITE(nValue);
-        READWRITE(nSequence);
         READWRITE(scriptPubKey);
-        if (nType & SER_DISK)
-            READWRITE(posNext);
     )
 
-    uint256 GetHash() const { return SerializeHash(*this); }
-
-    bool IsFinal() const
+    void SetNull()
     {
-        return (nSequence == UINT_MAX);
+        nValue = -1;
+        scriptPubKey.clear();
+    }
+
+    bool IsNull()
+    {
+        return (nValue == -1);
+    }
+
+    uint256 GetHash() const
+    {
+        return SerializeHash(*this);
     }
 
     bool IsMine() const
@@ -311,7 +326,6 @@ public:
     friend bool operator==(const CTxOut& a, const CTxOut& b)
     {
         return (a.nValue       == b.nValue &&
-                a.nSequence    == b.nSequence &&
                 a.scriptPubKey == b.scriptPubKey);
     }
 
@@ -320,12 +334,16 @@ public:
         return !(a == b);
     }
 
+    string ToString() const
+    {
+        if (scriptPubKey.size() < 6)
+            return "CTxOut(error)";
+        return strprintf("CTxOut(nValue=%I64d.%08I64d, scriptPubKey=%s)", nValue / COIN, nValue % COIN, scriptPubKey.ToString().substr(0,24).c_str());
+    }
+
     void print() const
     {
-        if (scriptPubKey.size() >= 6)
-            printf("CTxOut(nValue=%I64d, nSequence=%u, scriptPubKey=%02x%02x, posNext=", nValue, nSequence, scriptPubKey[4], scriptPubKey[5]);
-        posNext.print();
-        printf(")\n");
+        printf("%s\n", ToString().c_str());
     }
 };
 
@@ -339,9 +357,10 @@ public:
 class CTransaction
 {
 public:
+    int nVersion;
     vector<CTxIn> vin;
     vector<CTxOut> vout;
-    unsigned int nLockTime;
+    int nLockTime;
 
 
     CTransaction()
@@ -351,13 +370,8 @@ public:
 
     IMPLEMENT_SERIALIZE
     (
-        if (!(nType & SER_GETHASH))
-            READWRITE(nVersion);
-
-        // Set version on stream for writing back same version
-        if (fRead && s.nVersion == -1)
-            s.nVersion = nVersion;
-
+        READWRITE(this->nVersion);
+        nVersion = this->nVersion;
         READWRITE(vin);
         READWRITE(vout);
         READWRITE(nLockTime);
@@ -365,6 +379,7 @@ public:
 
     void SetNull()
     {
+        nVersion = 1;
         vin.clear();
         vout.clear();
         nLockTime = 0;
@@ -380,49 +395,39 @@ public:
         return SerializeHash(*this);
     }
 
-    bool AllPrevInMainChain() const
-    {
-        foreach(const CTxIn& txin, vin)
-            if (!txin.IsPrevInMainChain())
-                return false;
-        return true;
-    }
-
     bool IsFinal() const
     {
-        if (nLockTime == 0)
+        if (nLockTime == 0 || nLockTime < nBestHeight)
             return true;
-        if (nLockTime < GetAdjustedTime())
-            return true;
-        foreach(const CTxOut& txout, vout)
-            if (!txout.IsFinal())
+        foreach(const CTxIn& txin, vin)
+            if (!txin.IsFinal())
                 return false;
         return true;
     }
 
-    bool IsUpdate(const CTransaction& b) const
+    bool IsNewerThan(const CTransaction& old) const
     {
-        if (vin.size() != b.vin.size() || vout.size() != b.vout.size())
+        if (vin.size() != old.vin.size())
             return false;
         for (int i = 0; i < vin.size(); i++)
-            if (vin[i].prevout != b.vin[i].prevout)
+            if (vin[i].prevout != old.vin[i].prevout)
                 return false;
 
         bool fNewer = false;
         unsigned int nLowest = UINT_MAX;
-        for (int i = 0; i < vout.size(); i++)
+        for (int i = 0; i < vin.size(); i++)
         {
-            if (vout[i].nSequence != b.vout[i].nSequence)
+            if (vin[i].nSequence != old.vin[i].nSequence)
             {
-                if (vout[i].nSequence <= nLowest)
+                if (vin[i].nSequence <= nLowest)
                 {
                     fNewer = false;
-                    nLowest = vout[i].nSequence;
+                    nLowest = vin[i].nSequence;
                 }
-                if (b.vout[i].nSequence < nLowest)
+                if (old.vin[i].nSequence < nLowest)
                 {
                     fNewer = true;
-                    nLowest = b.vout[i].nSequence;
+                    nLowest = old.vin[i].nSequence;
                 }
             }
         }
@@ -438,27 +443,23 @@ public:
     {
         // Basic checks that don't depend on any context
         if (vin.empty() || vout.empty())
-            return false;
+            return error("CTransaction::CheckTransaction() : vin or vout empty");
 
         // Check for negative values
-        int64 nValueOut = 0;
         foreach(const CTxOut& txout, vout)
-        {
             if (txout.nValue < 0)
-                return false;
-            nValueOut += txout.nValue;
-        }
+                return error("CTransaction::CheckTransaction() : txout.nValue negative");
 
         if (IsCoinBase())
         {
-            if (vin[0].scriptSig.size() > 100)
-                return false;
+            if (vin[0].scriptSig.size() < 2 || vin[0].scriptSig.size() > 100)
+                return error("CTransaction::CheckTransaction() : coinbase script size");
         }
         else
         {
             foreach(const CTxIn& txin, vin)
                 if (txin.prevout.IsNull())
-                    return false;
+                    return error("CTransaction::CheckTransaction() : prevout is null");
         }
 
         return true;
@@ -500,24 +501,32 @@ public:
         return nValueOut;
     }
 
+    int64 GetMinFee(bool fDiscount=false) const
+    {
+        unsigned int nBytes = ::GetSerializeSize(*this, SER_NETWORK);
+        if (fDiscount && nBytes < 10000)
+            return 0;
+        return (1 + (int64)nBytes / 1000) * CENT;
+    }
+
 
 
     bool ReadFromDisk(CDiskTxPos pos, FILE** pfileRet=NULL)
     {
         CAutoFile filein = OpenBlockFile(pos.nFile, 0, pfileRet ? "rb+" : "rb");
         if (!filein)
-            return false;
+            return error("CTransaction::ReadFromDisk() : OpenBlockFile failed");
 
         // Read transaction
         if (fseek(filein, pos.nTxPos, SEEK_SET) != 0)
-            return false;
+            return error("CTransaction::ReadFromDisk() : fseek failed");
         filein >> *this;
 
         // Return file pointer
         if (pfileRet)
         {
             if (fseek(filein, pos.nTxPos, SEEK_SET) != 0)
-                return false;
+                return error("CTransaction::ReadFromDisk() : second fseek failed");
             *pfileRet = filein.release();
         }
         return true;
@@ -526,7 +535,8 @@ public:
 
     friend bool operator==(const CTransaction& a, const CTransaction& b)
     {
-        return (a.vin       == b.vin &&
+        return (a.nVersion  == b.nVersion &&
+                a.vin       == b.vin &&
                 a.vout      == b.vout &&
                 a.nLockTime == b.nLockTime);
     }
@@ -537,58 +547,45 @@ public:
     }
 
 
-    void print() const
+    string ToString() const
     {
-        printf("CTransaction(vin.size=%d, vout.size=%d, nLockTime=%d)\n",
+        string str;
+        str += strprintf("CTransaction(hash=%s, ver=%d, vin.size=%d, vout.size=%d, nLockTime=%d)\n",
+            GetHash().ToString().substr(0,6).c_str(),
+            nVersion,
             vin.size(),
             vout.size(),
             nLockTime);
         for (int i = 0; i < vin.size(); i++)
-        {
-            printf("    ");
-            vin[i].print();
-        }
+            str += "    " + vin[i].ToString() + "\n";
         for (int i = 0; i < vout.size(); i++)
-        {
-            printf("    ");
-            vout[i].print();
-        }
+            str += "    " + vout[i].ToString() + "\n";
+        return str;
     }
 
-
-
-    bool TestDisconnectInputs(CTxDB& txdb, map<uint256, CTransaction>& mapTestPool)
+    void print() const
     {
-        return DisconnectInputs(txdb, mapTestPool, true);
+        printf("%s", ToString().c_str());
     }
 
-    bool TestConnectInputs(CTxDB& txdb, map<uint256, CTransaction>& mapTestPool, bool fMemoryTx, bool fIgnoreDiskConflicts, int64& nFees)
-    {
-        return ConnectInputs(txdb, mapTestPool, CDiskTxPos(1, 1, 1), 0, true, fMemoryTx, fIgnoreDiskConflicts, nFees);
-    }
 
-    bool DisconnectInputs(CTxDB& txdb)
-    {
-        static map<uint256, CTransaction> mapTestPool;
-        return DisconnectInputs(txdb, mapTestPool, false);
-    }
 
-    bool ConnectInputs(CTxDB& txdb, CDiskTxPos posThisTx, int nHeight)
-    {
-        static map<uint256, CTransaction> mapTestPool;
-        int64 nFees;
-        return ConnectInputs(txdb, mapTestPool, posThisTx, nHeight, false, false, false, nFees);
-    }
-
-private:
-    bool DisconnectInputs(CTxDB& txdb, map<uint256, CTransaction>& mapTestPool, bool fTest);
-    bool ConnectInputs(CTxDB& txdb, map<uint256, CTransaction>& mapTestPool, CDiskTxPos posThisTx, int nHeight,
-                       bool fTest, bool fMemoryTx, bool fIgnoreDiskConflicts, int64& nFees);
-
-public:
-    bool AcceptTransaction(CTxDB& txdb, bool fCheckInputs=true);
-    bool AcceptTransaction() { CTxDB txdb("r"); return AcceptTransaction(txdb); }
+    bool DisconnectInputs(CTxDB& txdb);
+    bool ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPool, CDiskTxPos posThisTx, int nHeight, int64& nFees, bool fBlock, bool fMiner, int64 nMinFee=0);
     bool ClientConnectInputs();
+
+    bool AcceptTransaction(CTxDB& txdb, bool fCheckInputs=true, bool* pfMissingInputs=NULL);
+
+    bool AcceptTransaction(bool fCheckInputs=true, bool* pfMissingInputs=NULL)
+    {
+        CTxDB txdb("r");
+        return AcceptTransaction(txdb, fCheckInputs, pfMissingInputs);
+    }
+
+protected:
+    bool AddToMemoryPool();
+public:
+    bool RemoveFromMemoryPool();
 };
 
 
@@ -596,7 +593,7 @@ public:
 
 
 //
-// A transaction with a merkle branch linking it to the timechain
+// A transaction with a merkle branch linking it to the block chain
 //
 class CMerkleTx : public CTransaction
 {
@@ -604,6 +601,10 @@ public:
     uint256 hashBlock;
     vector<uint256> vMerkleBranch;
     int nIndex;
+
+    // memory only
+    mutable bool fMerkleVerified;
+
 
     CMerkleTx()
     {
@@ -619,21 +620,31 @@ public:
     {
         hashBlock = 0;
         nIndex = -1;
+        fMerkleVerified = false;
+    }
+
+    int64 GetCredit() const
+    {
+        // Must wait until coinbase is safely deep enough in the chain before valuing it
+        if (IsCoinBase() && GetBlocksToMaturity() > 0)
+            return 0;
+        return CTransaction::GetCredit();
     }
 
     IMPLEMENT_SERIALIZE
     (
         nSerSize += SerReadWrite(s, *(CTransaction*)this, nType, nVersion, ser_action);
-        if (!(nType & SER_GETHASH))
-            READWRITE(nVersion);
+        nVersion = this->nVersion;
         READWRITE(hashBlock);
         READWRITE(vMerkleBranch);
         READWRITE(nIndex);
     )
 
 
-    int SetMerkleBranch();
-    int IsInMainChain() const;
+    int SetMerkleBranch(const CBlock* pblock=NULL);
+    int GetDepthInMainChain() const;
+    bool IsInMainChain() const { return GetDepthInMainChain() > 0; }
+    int GetBlocksToMaturity() const;
     bool AcceptTransaction(CTxDB& txdb, bool fCheckInputs=true);
     bool AcceptTransaction() { CTxDB txdb("r"); return AcceptTransaction(txdb); }
 };
@@ -644,7 +655,7 @@ public:
 //
 // A transaction with a bunch of additional info that only the owner cares
 // about.  It includes any unrecorded transactions needed to link it back
-// to the timechain.
+// to the block chain.
 //
 class CWalletTx : public CMerkleTx
 {
@@ -652,11 +663,15 @@ public:
     vector<CMerkleTx> vtxPrev;
     map<string, string> mapValue;
     vector<pair<string, string> > vOrderForm;
-    unsigned int nTime;
+    unsigned int fTimeReceivedIsTxTime;
+    unsigned int nTimeReceived;  // time received by this node
     char fFromMe;
     char fSpent;
-
     //// probably need to sign the order info so know it came from payer
+
+    // memory only
+    mutable unsigned int nTimeDisplayed;
+
 
     CWalletTx()
     {
@@ -675,21 +690,22 @@ public:
 
     void Init()
     {
-        nTime = 0;
+        fTimeReceivedIsTxTime = false;
+        nTimeReceived = 0;
         fFromMe = false;
         fSpent = false;
+        nTimeDisplayed = 0;
     }
 
     IMPLEMENT_SERIALIZE
     (
-        /// would be nice for it to return the version number it reads, maybe use a reference
         nSerSize += SerReadWrite(s, *(CMerkleTx*)this, nType, nVersion, ser_action);
-        if (!(nType & SER_GETHASH))
-            READWRITE(nVersion);
+        nVersion = this->nVersion;
         READWRITE(vtxPrev);
         READWRITE(mapValue);
         READWRITE(vOrderForm);
-        READWRITE(nTime);
+        READWRITE(fTimeReceivedIsTxTime);
+        READWRITE(nTimeReceived);
         READWRITE(fFromMe);
         READWRITE(fSpent);
     )
@@ -700,8 +716,9 @@ public:
     }
 
 
+    int64 GetTxTime() const;
+
     void AddSupportingTransactions(CTxDB& txdb);
-    void AddSupportingTransactions() { CTxDB txdb("r"); AddSupportingTransactions(txdb); }
 
     bool AcceptWalletTransaction(CTxDB& txdb, bool fCheckInputs=true);
     bool AcceptWalletTransaction() { CTxDB txdb("r"); return AcceptWalletTransaction(txdb); }
@@ -713,13 +730,72 @@ public:
 
 
 
+//
+// A txdb record that contains the disk location of a transaction and the
+// locations of transactions that spend its outputs.  vSpent is really only
+// used as a flag, but having the location is very helpful for debugging.
+//
+class CTxIndex
+{
+public:
+    CDiskTxPos pos;
+    vector<CDiskTxPos> vSpent;
+
+    CTxIndex()
+    {
+        SetNull();
+    }
+
+    CTxIndex(const CDiskTxPos& posIn, unsigned int nOutputs)
+    {
+        pos = posIn;
+        vSpent.resize(nOutputs);
+    }
+
+    IMPLEMENT_SERIALIZE
+    (
+        if (!(nType & SER_GETHASH))
+            READWRITE(nVersion);
+        READWRITE(pos);
+        READWRITE(vSpent);
+    )
+
+    void SetNull()
+    {
+        pos.SetNull();
+        vSpent.clear();
+    }
+
+    bool IsNull()
+    {
+        return pos.IsNull();
+    }
+
+    friend bool operator==(const CTxIndex& a, const CTxIndex& b)
+    {
+        if (a.pos != b.pos || a.vSpent.size() != b.vSpent.size())
+            return false;
+        for (int i = 0; i < a.vSpent.size(); i++)
+            if (a.vSpent[i] != b.vSpent[i])
+                return false;
+        return true;
+    }
+
+    friend bool operator!=(const CTxIndex& a, const CTxIndex& b)
+    {
+        return !(a == b);
+    }
+};
+
+
+
 
 
 //
 // Nodes collect new transactions into a block, hash them into a hash tree,
 // and scan through nonce values to make the block's hash satisfy proof-of-work
 // requirements.  When they solve the proof-of-work, they broadcast the block
-// to everyone and the block is added to the timechain.  The first transaction
+// to everyone and the block is added to the block chain.  The first transaction
 // in the block is a special one that creates a new coin owned by the creator
 // of the block.
 //
@@ -730,6 +806,7 @@ class CBlock
 {
 public:
     // header
+    int nVersion;
     uint256 hashPrevBlock;
     uint256 hashMerkleRoot;
     unsigned int nTime;
@@ -750,8 +827,8 @@ public:
 
     IMPLEMENT_SERIALIZE
     (
-        if (!(nType & SER_GETHASH))
-            READWRITE(nVersion);
+        READWRITE(this->nVersion);
+        nVersion = this->nVersion;
         READWRITE(hashPrevBlock);
         READWRITE(hashMerkleRoot);
         READWRITE(nTime);
@@ -767,6 +844,7 @@ public:
 
     void SetNull()
     {
+        nVersion = 1;
         hashPrevBlock = 0;
         hashMerkleRoot = 0;
         nTime = 0;
@@ -783,8 +861,9 @@ public:
 
     uint256 GetHash() const
     {
-        return Hash(BEGIN(hashPrevBlock), END(nNonce));
+        return Hash(BEGIN(nVersion), END(nNonce));
     }
+
 
     uint256 BuildMerkleTree() const
     {
@@ -823,6 +902,8 @@ public:
 
     static uint256 CheckMerkleBranch(uint256 hash, const vector<uint256>& vMerkleBranch, int nIndex)
     {
+        if (nIndex == -1)
+            return 0;
         foreach(const uint256& otherside, vMerkleBranch)
         {
             if (nIndex & 1)
@@ -840,7 +921,7 @@ public:
         // Open history file to append
         CAutoFile fileout = AppendBlockFile(nFileRet);
         if (!fileout)
-            return false;
+            return error("CBlock::WriteToDisk() : AppendBlockFile failed");
         if (!fWriteTransactions)
             fileout.nType |= SER_BLOCKHEADERONLY;
 
@@ -851,7 +932,7 @@ public:
         // Write block
         nBlockPosRet = ftell(fileout);
         if (nBlockPosRet == -1)
-            return false;
+            return error("CBlock::WriteToDisk() : ftell failed");
         fileout << *this;
 
         return true;
@@ -864,7 +945,7 @@ public:
         // Open history file to read
         CAutoFile filein = OpenBlockFile(nFile, nBlockPos, "rb");
         if (!filein)
-            return false;
+            return error("CBlock::ReadFromDisk() : OpenBlockFile failed");
         if (!fReadTransactions)
             filein.nType |= SER_BLOCKHEADERONLY;
 
@@ -872,8 +953,10 @@ public:
         filein >> *this;
 
         // Check the header
-        if (nBits < MINPROOFOFWORK || GetHash() > (~uint256(0) >> nBits))
-            return error("CBlock::ReadFromDisk : errors in block header");
+        if (CBigNum().SetCompact(nBits) > bnProofOfWorkLimit)
+            return error("CBlock::ReadFromDisk() : nBits errors in block header");
+        if (GetHash() > CBigNum().SetCompact(nBits).getuint256())
+            return error("CBlock::ReadFromDisk() : GetHash() errors in block header");
 
         return true;
     }
@@ -882,8 +965,10 @@ public:
 
     void print() const
     {
-        printf("CBlock(hashPrevBlock=%s, hashMerkleRoot=%s, nTime=%u, nBits=%u, nNonce=%u, vtx=%d)\n",
-            hashPrevBlock.ToString().substr(0,6).c_str(),
+        printf("CBlock(hash=%s, ver=%d, hashPrevBlock=%s, hashMerkleRoot=%s, nTime=%u, nBits=%08x, nNonce=%u, vtx=%d)\n",
+            GetHash().ToString().substr(0,14).c_str(),
+            nVersion,
+            hashPrevBlock.ToString().substr(0,14).c_str(),
             hashMerkleRoot.ToString().substr(0,6).c_str(),
             nTime, nBits, nNonce,
             vtx.size());
@@ -899,13 +984,11 @@ public:
     }
 
 
-
+    int64 GetBlockValue(int64 nFees) const;
+    bool DisconnectBlock(CTxDB& txdb, CBlockIndex* pindex);
+    bool ConnectBlock(CTxDB& txdb, CBlockIndex* pindex);
     bool ReadFromDisk(const CBlockIndex* blockindex, bool fReadTransactions);
-    bool TestDisconnectBlock(CTxDB& txdb, map<uint256, CTransaction>& mapTestPool);
-    bool TestConnectBlock(CTxDB& txdb, map<uint256, CTransaction>& mapTestPool);
-    bool DisconnectBlock();
-    bool ConnectBlock(unsigned int nFile, unsigned int nBlockPos, int nHeight);
-    bool AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, bool fWriteDisk);
+    bool AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos);
     bool CheckBlock() const;
     bool AcceptBlock();
 };
@@ -916,7 +999,7 @@ public:
 
 
 //
-// The timechain is a tree shaped structure starting with the
+// The block chain is a tree shaped structure starting with the
 // genesis block at the root, with each block potentially having multiple
 // candidates to be the next block.  pprev and pnext link a path through the
 // main/longest chain.  A blockindex may have multiple pprev pointing back
@@ -926,29 +1009,56 @@ public:
 class CBlockIndex
 {
 public:
+    const uint256* phashBlock;
     CBlockIndex* pprev;
     CBlockIndex* pnext;
     unsigned int nFile;
     unsigned int nBlockPos;
     int nHeight;
 
+    // block header
+    int nVersion;
+    uint256 hashMerkleRoot;
+    unsigned int nTime;
+    unsigned int nBits;
+    unsigned int nNonce;
+
 
     CBlockIndex()
     {
+        phashBlock = NULL;
         pprev = NULL;
         pnext = NULL;
         nFile = 0;
         nBlockPos = 0;
         nHeight = 0;
+
+        nVersion       = 0;
+        hashMerkleRoot = 0;
+        nTime          = 0;
+        nBits          = 0;
+        nNonce         = 0;
     }
 
-    CBlockIndex(unsigned int nFileIn, unsigned int nBlockPosIn)
+    CBlockIndex(unsigned int nFileIn, unsigned int nBlockPosIn, CBlock& block)
     {
+        phashBlock = NULL;
         pprev = NULL;
         pnext = NULL;
         nFile = nFileIn;
         nBlockPos = nBlockPosIn;
         nHeight = 0;
+
+        nVersion       = block.nVersion;
+        hashMerkleRoot = block.hashMerkleRoot;
+        nTime          = block.nTime;
+        nBits          = block.nBits;
+        nNonce         = block.nNonce;
+    }
+
+    uint256 GetBlockHash() const
+    {
+        return *phashBlock;
     }
 
     bool IsInMainChain() const
@@ -971,50 +1081,122 @@ public:
         return true;
     }
 
+    enum { nMedianTimeSpan=11 };
 
-
-    bool TestDisconnectBlock(CTxDB& txdb, map<uint256, CTransaction>& mapTestPool)
+    int64 GetMedianTimePast() const
     {
-        CBlock block;
-        if (!block.ReadFromDisk(nFile, nBlockPos, true))
-            return false;
-        return block.TestDisconnectBlock(txdb, mapTestPool);
+        unsigned int pmedian[nMedianTimeSpan];
+        unsigned int* pbegin = &pmedian[nMedianTimeSpan];
+        unsigned int* pend = &pmedian[nMedianTimeSpan];
+
+        const CBlockIndex* pindex = this;
+        for (int i = 0; i < nMedianTimeSpan && pindex; i++, pindex = pindex->pprev)
+            *(--pbegin) = pindex->nTime;
+
+        sort(pbegin, pend);
+        return pbegin[(pend - pbegin)/2];
     }
 
-    bool TestConnectBlock(CTxDB& txdb, map<uint256, CTransaction>& mapTestPool)
+    int64 GetMedianTime() const
     {
-        CBlock block;
-        if (!block.ReadFromDisk(nFile, nBlockPos, true))
-            return false;
-        return block.TestConnectBlock(txdb, mapTestPool);
-    }
-
-    bool DisconnectBlock()
-    {
-        CBlock block;
-        if (!block.ReadFromDisk(nFile, nBlockPos, true))
-            return false;
-        return block.DisconnectBlock();
-    }
-
-    bool ConnectBlock()
-    {
-        CBlock block;
-        if (!block.ReadFromDisk(nFile, nBlockPos, true))
-            return false;
-        return block.ConnectBlock(nFile, nBlockPos, nHeight);
+        const CBlockIndex* pindex = this;
+        for (int i = 0; i < nMedianTimeSpan/2; i++)
+        {
+            if (!pindex->pnext)
+                return nTime;
+            pindex = pindex->pnext;
+        }
+        return pindex->GetMedianTimePast();
     }
 
 
+
+    string ToString() const
+    {
+        return strprintf("CBlockIndex(nprev=%08x, pnext=%08x, nFile=%d, nBlockPos=%-6d nHeight=%d, merkle=%s, hashBlock=%s)",
+            pprev, pnext, nFile, nBlockPos, nHeight,
+            hashMerkleRoot.ToString().substr(0,6).c_str(),
+            GetBlockHash().ToString().substr(0,14).c_str());
+    }
 
     void print() const
     {
-        printf("CBlockIndex(nprev=%08x, pnext=%08x, nFile=%d, nBlockPos=%d, nHeight=%d)\n",
-            pprev, pnext, nFile, nBlockPos, nHeight);
+        printf("%s\n", ToString().c_str());
     }
 };
 
-void PrintTimechain();
+
+
+//
+// Used to marshal pointers into hashes for db storage.
+//
+class CDiskBlockIndex : public CBlockIndex
+{
+public:
+    uint256 hashPrev;
+    uint256 hashNext;
+
+    CDiskBlockIndex()
+    {
+        hashPrev = 0;
+        hashNext = 0;
+    }
+
+    explicit CDiskBlockIndex(CBlockIndex* pindex) : CBlockIndex(*pindex)
+    {
+        hashPrev = (pprev ? pprev->GetBlockHash() : 0);
+        hashNext = (pnext ? pnext->GetBlockHash() : 0);
+    }
+
+    IMPLEMENT_SERIALIZE
+    (
+        if (!(nType & SER_GETHASH))
+            READWRITE(nVersion);
+
+        READWRITE(hashNext);
+        READWRITE(nFile);
+        READWRITE(nBlockPos);
+        READWRITE(nHeight);
+
+        // block header
+        READWRITE(this->nVersion);
+        READWRITE(hashPrev);
+        READWRITE(hashMerkleRoot);
+        READWRITE(nTime);
+        READWRITE(nBits);
+        READWRITE(nNonce);
+    )
+
+    uint256 GetBlockHash() const
+    {
+        CBlock block;
+        block.nVersion        = nVersion;
+        block.hashPrevBlock   = hashPrev;
+        block.hashMerkleRoot  = hashMerkleRoot;
+        block.nTime           = nTime;
+        block.nBits           = nBits;
+        block.nNonce          = nNonce;
+        return block.GetHash();
+    }
+
+
+    string ToString() const
+    {
+        string str = "CDiskBlockIndex(";
+        str += CBlockIndex::ToString();
+        str += strprintf("\n                hashBlock=%s, hashPrev=%s, hashNext=%s)",
+            GetBlockHash().ToString().c_str(),
+            hashPrev.ToString().substr(0,14).c_str(),
+            hashNext.ToString().substr(0,14).c_str());
+        return str;
+    }
+
+    void print() const
+    {
+        printf("%s\n", ToString().c_str());
+    }
+};
+
 
 
 
@@ -1023,9 +1205,9 @@ void PrintTimechain();
 
 
 //
-// Describes a place in the timechain to another node such that if the
+// Describes a place in the block chain to another node such that if the
 // other node doesn't have the same branch, it can find a recent common trunk.
-// The further back it is, the further before the branch point it may be.
+// The further back it is, the further before the fork it may be.
 //
 class CBlockLocator
 {
@@ -1062,9 +1244,7 @@ public:
         int nStep = 1;
         while (pindex)
         {
-            CBlock block;
-            block.ReadFromDisk(pindex, false);
-            vHave.push_back(block.GetHash());
+            vHave.push_back(pindex->GetBlockHash());
 
             // Exponentially larger steps back
             for (int i = 0; pindex && i < nStep; i++)
@@ -1072,6 +1252,7 @@ public:
             if (vHave.size() > 10)
                 nStep *= 2;
         }
+        vHave.push_back(hashGenesisBlock);
     }
 
     CBlockIndex* GetBlockIndex()

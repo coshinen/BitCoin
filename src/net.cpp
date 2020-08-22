@@ -1,22 +1,6 @@
-// Copyright (c) 2008 Satoshi Nakamoto
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in
-// all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE, TITLE AND NON-INFRINGEMENT. IN NO EVENT
-// SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
-// OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-// IN THE SOFTWARE.
+// Copyright (c) 2009 Satoshi Nakamoto
+// Distributed under the MIT/X11 software license, see the accompanying
+// file license.txt or http://www.opensource.org/licenses/mit-license.php.
 
 #include "headers.h"
 #include <winsock2.h>
@@ -51,11 +35,110 @@ map<CInv, int64> mapAlreadyAskedFor;
 
 
 
+CAddress addrProxy;
+
+bool ConnectSocket(const CAddress& addrConnect, SOCKET& hSocketRet)
+{
+    hSocketRet = INVALID_SOCKET;
+
+    SOCKET hSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (hSocket == INVALID_SOCKET)
+        return false;
+
+    bool fRoutable = !(addrConnect.GetByte(3) == 10 || (addrConnect.GetByte(3) == 192 && addrConnect.GetByte(2) == 168));
+    bool fProxy = (addrProxy.ip && fRoutable);
+    struct sockaddr_in sockaddr = (fProxy ? addrProxy.GetSockAddr() : addrConnect.GetSockAddr());
+
+    if (connect(hSocket, (struct sockaddr*)&sockaddr, sizeof(sockaddr)) == SOCKET_ERROR)
+    {
+        closesocket(hSocket);
+        return false;
+    }
+
+    if (fProxy)
+    {
+        printf("Proxy connecting to %s\n", addrConnect.ToString().c_str());
+        char pszSocks4IP[] = "\4\1\0\0\0\0\0\0user";
+        memcpy(pszSocks4IP + 2, &addrConnect.port, 2);
+        memcpy(pszSocks4IP + 4, &addrConnect.ip, 4);
+        char* pszSocks4 = pszSocks4IP;
+        int nSize = sizeof(pszSocks4IP);
+
+        int ret = send(hSocket, pszSocks4, nSize, 0);
+        if (ret != nSize)
+        {
+            closesocket(hSocket);
+            return error("Error sending to proxy\n");
+        }
+        char pchRet[8];
+        if (recv(hSocket, pchRet, 8, 0) != 8)
+        {
+            closesocket(hSocket);
+            return error("Error reading proxy response\n");
+        }
+        if (pchRet[1] != 0x5a)
+        {
+            closesocket(hSocket);
+            return error("Proxy returned error %d\n", pchRet[1]);
+        }
+        printf("Proxy connection established %s\n", addrConnect.ToString().c_str());
+    }
+
+    hSocketRet = hSocket;
+    return true;
+}
+
+
+bool GetMyExternalIP(unsigned int& ipRet)
+{
+    CAddress addrConnect("72.233.89.199:80"); // whatismyip.com 198-200
+
+    SOCKET hSocket;
+    if (!ConnectSocket(addrConnect, hSocket))
+        return error("GetMyExternalIP() : connection to %s failed\n", addrConnect.ToString().c_str());
+
+    char* pszGet =
+        "GET /automation/n09230945.asp HTTP/1.1\r\n"
+        "Host: www.whatismyip.com\r\n"
+        "User-Agent: Bitcoin/0.1\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+    send(hSocket, pszGet, strlen(pszGet), 0);
+
+    string strLine;
+    while (RecvLine(hSocket, strLine))
+    {
+        if (strLine.empty())
+        {
+            if (!RecvLine(hSocket, strLine))
+            {
+                closesocket(hSocket);
+                return false;
+            }
+            closesocket(hSocket);
+            CAddress addr(strLine.c_str());
+            printf("GetMyExternalIP() received [%s] %s\n", strLine.c_str(), addr.ToString().c_str());
+            if (addr.ip == 0)
+                return false;
+            ipRet = addr.ip;
+            return true;
+        }
+    }
+    closesocket(hSocket);
+    return error("GetMyExternalIP() : connection closed\n");
+}
+
+
+
 
 
 
 bool AddAddress(CAddrDB& addrdb, const CAddress& addr)
 {
+    if (!addr.IsRoutable())
+        return false;
+    if (addr.ip == addrLocalHost.ip)
+        return false;
     CRITICAL_BLOCK(cs_mapAddresses)
     {
         map<vector<unsigned char>, CAddress>::iterator it = mapAddresses.find(addr.GetKey());
@@ -114,6 +197,81 @@ void AbandonRequests(void (*fn)(void*, CDataStream&), void* param1)
 
 
 
+//
+// Subscription methods for the broadcast and subscription system.
+// Channel numbers are message numbers, i.e. MSG_TABLE and MSG_PRODUCT.
+//
+// The subscription system uses a meet-in-the-middle strategy.
+// With 100,000 nodes, if senders broadcast to 1000 random nodes and receivers
+// subscribe to 1000 random nodes, 99.995% (1 - 0.99^1000) of messages will get through.
+//
+
+bool AnySubscribed(unsigned int nChannel)
+{
+    if (pnodeLocalHost->IsSubscribed(nChannel))
+        return true;
+    CRITICAL_BLOCK(cs_vNodes)
+        foreach(CNode* pnode, vNodes)
+            if (pnode->IsSubscribed(nChannel))
+                return true;
+    return false;
+}
+
+bool CNode::IsSubscribed(unsigned int nChannel)
+{
+    if (nChannel >= vfSubscribe.size())
+        return false;
+    return vfSubscribe[nChannel];
+}
+
+void CNode::Subscribe(unsigned int nChannel, unsigned int nHops)
+{
+    if (nChannel >= vfSubscribe.size())
+        return;
+
+    if (!AnySubscribed(nChannel))
+    {
+        // Relay subscribe
+        CRITICAL_BLOCK(cs_vNodes)
+            foreach(CNode* pnode, vNodes)
+                if (pnode != this)
+                    pnode->PushMessage("subscribe", nChannel, nHops);
+    }
+
+    vfSubscribe[nChannel] = true;
+}
+
+void CNode::CancelSubscribe(unsigned int nChannel)
+{
+    if (nChannel >= vfSubscribe.size())
+        return;
+
+    // Prevent from relaying cancel if wasn't subscribed
+    if (!vfSubscribe[nChannel])
+        return;
+    vfSubscribe[nChannel] = false;
+
+    if (!AnySubscribed(nChannel))
+    {
+        // Relay subscription cancel
+        CRITICAL_BLOCK(cs_vNodes)
+            foreach(CNode* pnode, vNodes)
+                if (pnode != this)
+                    pnode->PushMessage("sub-cancel", nChannel);
+
+        // Clear memory, no longer subscribed
+        if (nChannel == MSG_PRODUCT)
+            CRITICAL_BLOCK(cs_mapProducts)
+                mapProducts.clear();
+    }
+}
+
+
+
+
+
+
+
 
 
 CNode* FindNode(unsigned int ip)
@@ -154,46 +312,33 @@ CNode* ConnectNode(CAddress addrConnect, int64 nTimeout)
         return pnode;
     }
 
+    /// debug print
+    printf("trying %s\n", addrConnect.ToString().c_str());
+
     // Connect
-    SOCKET hSocket = socket(AF_INET, SOCK_STREAM, 0);
-    if (hSocket == INVALID_SOCKET)
+    SOCKET hSocket;
+    if (ConnectSocket(addrConnect, hSocket))
     {
-        printf("socket failed\n");
-        return NULL;
-    }
-
-    struct sockaddr_in sockaddr;
-    sockaddr.sin_family = AF_INET;
-    sockaddr.sin_addr.s_addr = addrConnect.ip;
-    sockaddr.sin_port = addrConnect.port;
-
         /// debug print
-        static map<unsigned int, unsigned int> mapPrintLimit;
-        if (mapPrintLimit[addrConnect.ip] % 20 == 0)
-            printf("connecting to %d.%d.%d.%d\n", ((unsigned char*)&sockaddr.sin_addr.s_addr)[0], ((unsigned char*)&sockaddr.sin_addr.s_addr)[1], ((unsigned char*)&sockaddr.sin_addr.s_addr)[2], ((unsigned char*)&sockaddr.sin_addr.s_addr)[3]);
-
-    if (connect(hSocket, (struct sockaddr*)&sockaddr, sizeof(sockaddr)) != SOCKET_ERROR)
-    {
-            /// debug print
-            mapPrintLimit[addrConnect.ip] = 0;
-            printf("connected %d.%d.%d.%d\n", ((unsigned char*)&sockaddr.sin_addr.s_addr)[0], ((unsigned char*)&sockaddr.sin_addr.s_addr)[1], ((unsigned char*)&sockaddr.sin_addr.s_addr)[2], ((unsigned char*)&sockaddr.sin_addr.s_addr)[3]);
+        printf("connected %s\n", addrConnect.ToString().c_str());
 
         // Add node
-        CNode* pnode = new CNode(hSocket, addrConnect);
+        CNode* pnode = new CNode(hSocket, addrConnect, false);
         if (nTimeout != 0)
             pnode->AddRef(nTimeout);
         else
             pnode->AddRef();
         CRITICAL_BLOCK(cs_vNodes)
             vNodes.push_back(pnode);
+
+        CRITICAL_BLOCK(cs_mapAddresses)
+            mapAddresses[addrConnect.GetKey()].nLastFailed = 0;
         return pnode;
     }
     else
     {
-        //// todo: need to set last failed connect time, and increment a failed to connect counter
-        /// debug print
-        if ((mapPrintLimit[addrConnect.ip]++) % 20 == 0)
-            printf("connection failed %d\n", WSAGetLastError());
+        CRITICAL_BLOCK(cs_mapAddresses)
+            mapAddresses[addrConnect.GetKey()].nLastFailed = GetTime();
         return NULL;
     }
 }
@@ -207,10 +352,6 @@ void CNode::Disconnect()
     // All of a nodes broadcasts and subscriptions are automatically torn down
     // when it goes down, so a node has to stay up to keep its broadcast going.
 
-    // Cancel and delete unsourced broadcasts
-    CRITICAL_BLOCK(cs_mapTables)
-        for (map<uint256, CTable>::iterator mi = mapTables.begin(); mi != mapTables.end();)
-            AdvertRemoveSource(this, MSG_TABLE, 0, (*(mi++)).second);
     CRITICAL_BLOCK(cs_mapProducts)
         for (map<uint256, CProduct>::iterator mi = mapProducts.begin(); mi != mapProducts.end();)
             AdvertRemoveSource(this, MSG_PRODUCT, 0, (*(mi++)).second);
@@ -269,6 +410,8 @@ void ThreadSocketHandler2(void* parg)
             map<unsigned int, CNode*> mapFirst;
             foreach(CNode* pnode, vNodes)
             {
+                if (pnode->fDisconnect)
+                    continue;
                 unsigned int ip = pnode->addr.ip;
                 if (mapFirst.count(ip) && addrLocalHost.ip < ip)
                 {
@@ -281,7 +424,7 @@ void ThreadSocketHandler2(void* parg)
 
                     if (pnodeExtra->GetRefCount() <= (pnodeExtra->fNetworkNode ? 1 : 0))
                     {
-                        printf("(%d nodes) disconnecting duplicate: %s", vNodes.size(), pnodeExtra->addr.ToString().c_str());
+                        printf("(%d nodes) disconnecting duplicate: %s\n", vNodes.size(), pnodeExtra->addr.ToString().c_str());
                         if (pnodeExtra->fNetworkNode && !pnode->fNetworkNode)
                         {
                             pnode->AddRef();
@@ -381,11 +524,9 @@ void ThreadSocketHandler2(void* parg)
             }
             Sleep(timeout.tv_usec/1000);
         }
-        LARGE_INTEGER PerformanceCount;
-        QueryPerformanceCounter(&PerformanceCount);
-        RAND_add(&PerformanceCount.LowPart, sizeof(PerformanceCount.LowPart), 1.0);
+        RandAddSeed();
 
-        //// debug
+        //// debug print
         //foreach(CNode* pnode, vNodes)
         //{
         //    printf("vRecv = %-5d ", pnode->vRecv.size());
@@ -402,7 +543,7 @@ void ThreadSocketHandler2(void* parg)
             struct sockaddr_in sockaddr;
             int len = sizeof(sockaddr);
             SOCKET hSocket = accept(hListenSocket, (struct sockaddr*)&sockaddr, &len);
-            CAddress addr(sockaddr.sin_addr.s_addr, sockaddr.sin_port);
+            CAddress addr(sockaddr);
             if (hSocket == INVALID_SOCKET)
             {
                 if (WSAGetLastError() != WSAEWOULDBLOCK)
@@ -410,10 +551,9 @@ void ThreadSocketHandler2(void* parg)
             }
             else
             {
-                printf("%s accepted connection from %s\n", addrLocalHost.ToString().c_str(), addr.ToString().c_str());
-                CNode* pnode = new CNode(hSocket, addr);
+                printf("accepted connection from %s\n", addr.ToString().c_str());
+                CNode* pnode = new CNode(hSocket, addr, true);
                 pnode->AddRef();
-                pnode->fInbound = true;
                 CRITICAL_BLOCK(cs_vNodes)
                     vNodes.push_back(pnode);
             }
@@ -533,110 +673,118 @@ void ThreadOpenConnections(void* parg)
 void ThreadOpenConnections2(void* parg)
 {
     printf("ThreadOpenConnections started\n");
-    unsigned int nTries = 0;
+
+    // Initiate network connections
+    const int nMaxConnections = 15;
     loop
     {
-        //// number of connections may still need to be increased before release
-        // Initiate network connections
-        if (vNodes.size() < 5 && vNodes.size() < mapAddresses.size())
+        // Wait
+        vfThreadRunning[1] = false;
+        Sleep(500);
+        while (vNodes.size() >= nMaxConnections || vNodes.size() >= mapAddresses.size())
         {
-            // Make a list of unique class C's
-            unsigned char pchIPCMask[4] = { 0xff, 0xff, 0xff, 0x00 };
-            unsigned int nIPCMask = *(unsigned int*)pchIPCMask;
-            vector<unsigned int> vIPC;
+            CheckForShutdown(1);
+            Sleep(2000);
+        }
+        vfThreadRunning[1] = true;
+        CheckForShutdown(1);
+
+
+        // Make a list of unique class C's
+        unsigned char pchIPCMask[4] = { 0xff, 0xff, 0xff, 0x00 };
+        unsigned int nIPCMask = *(unsigned int*)pchIPCMask;
+        vector<unsigned int> vIPC;
+        CRITICAL_BLOCK(cs_mapAddresses)
+        {
+            vIPC.reserve(mapAddresses.size());
+            unsigned int nPrev = 0;
+            foreach(const PAIRTYPE(vector<unsigned char>, CAddress)& item, mapAddresses)
+            {
+                const CAddress& addr = item.second;
+                if (!addr.IsIPv4())
+                    continue;
+
+                // Taking advantage of mapAddresses being in sorted order,
+                // with IPs of the same class C grouped together.
+                unsigned int ipC = addr.ip & nIPCMask;
+                if (ipC != nPrev)
+                    vIPC.push_back(nPrev = ipC);
+            }
+        }
+
+        //
+        // The IP selection process is designed to limit vulnerability to address flooding.
+        // Any class C (a.b.c.?) has an equal chance of being chosen, then an IP is
+        // chosen within the class C.  An attacker may be able to allocate many IPs, but
+        // they would normally be concentrated in blocks of class C's.  They can hog the
+        // attention within their class C, but not the whole IP address space overall.
+        // A lone node in a class C will get as much attention as someone holding all 255
+        // IPs in another class C.
+        //
+        bool fSuccess = false;
+        int nLimit = vIPC.size();
+        while (!fSuccess && nLimit-- > 0)
+        {
+            // Choose a random class C
+            unsigned int ipC = vIPC[GetRand(vIPC.size())];
+
+            // Organize all addresses in the class C by IP
+            map<unsigned int, vector<CAddress> > mapIP;
             CRITICAL_BLOCK(cs_mapAddresses)
             {
-                vIPC.reserve(mapAddresses.size());
-                unsigned int nPrev = 0;
-                foreach(const PAIRTYPE(vector<unsigned char>, CAddress)& item, mapAddresses)
+                unsigned int nDelay = ((30 * 60) << vNodes.size());
+                if (nDelay > 8 * 60 * 60)
+                    nDelay = 8 * 60 * 60;
+                for (map<vector<unsigned char>, CAddress>::iterator mi = mapAddresses.lower_bound(CAddress(ipC, 0).GetKey());
+                     mi != mapAddresses.upper_bound(CAddress(ipC | ~nIPCMask, 0xffff).GetKey());
+                     ++mi)
                 {
-                    const CAddress& addr = item.second;
-                    if (!addr.IsIPv4())
-                        continue;
-
-                    // Taking advantage of mapAddresses being in sorted order,
-                    // with IPs of the same class C grouped together.
-                    unsigned int ipC = addr.ip & nIPCMask;
-                    if (ipC != nPrev)
-                        vIPC.push_back(nPrev = ipC);
+                    const CAddress& addr = (*mi).second;
+                    unsigned int nRandomizer = (addr.nLastFailed * addr.ip * 7777U) % 20000;
+                    if (GetTime() - addr.nLastFailed > nDelay * nRandomizer / 10000)
+                        mapIP[addr.ip].push_back(addr);
                 }
             }
+            if (mapIP.empty())
+                break;
 
-            //
-            // The IP selection process is designed to limit vulnerability to address flooding.
-            // Any class C (a.b.c.?) has an equal chance of being chosen, then an IP is
-            // chosen within the class C.  An attacker may be able to allocate many IPs, but
-            // they would normally be concentrated in blocks of class C's.  They can hog the
-            // attention within their class C, but not the whole IP address space overall.
-            // A lone node in a class C will get as much attention as someone holding all 255
-            // IPs in another class C.
-            //
-            bool fSuccess = false;
-            int nLimit = vIPC.size();
-            while (!fSuccess && nLimit-- > 0)
+            // Choose a random IP in the class C
+            map<unsigned int, vector<CAddress> >::iterator mi = mapIP.begin();
+            advance(mi, GetRand(mapIP.size()));
+
+            // Once we've chosen an IP, we'll try every given port before moving on
+            foreach(const CAddress& addrConnect, (*mi).second)
             {
-                // Choose a random class C
-                uint64 nRand;
-                RAND_bytes((unsigned char*)&nRand, sizeof(nRand));
-                unsigned int ipC = vIPC[nRand % vIPC.size()];
+                if (addrConnect.ip == addrLocalHost.ip || !addrConnect.IsIPv4() || FindNode(addrConnect.ip))
+                    continue;
 
-                // Organize all addresses in the class C by IP
-                map<unsigned int, vector<CAddress> > mapIP;
-                CRITICAL_BLOCK(cs_mapAddresses)
+                CNode* pnode = ConnectNode(addrConnect);
+                if (!pnode)
+                    continue;
+                pnode->fNetworkNode = true;
+
+                if (addrLocalHost.IsRoutable())
                 {
-                    for (map<vector<unsigned char>, CAddress>::iterator mi = mapAddresses.lower_bound(CAddress(ipC, 0).GetKey());
-                         mi != mapAddresses.upper_bound(CAddress(ipC | ~nIPCMask, 0xffff).GetKey());
-                         ++mi)
-                    {
-                        const CAddress& addr = (*mi).second;
-                        mapIP[addr.ip].push_back(addr);
-                    }
-                }
-
-                // Choose a random IP in the class C
-                RAND_bytes((unsigned char*)&nRand, sizeof(nRand));
-                map<unsigned int, vector<CAddress> >::iterator mi = mapIP.begin();
-                advance(mi, nRand % mapIP.size());
-
-                // Once we've chosen an IP, we'll try every given port before moving on
-                foreach(const CAddress& addrConnect, (*mi).second)
-                {
-                    if (addrConnect.ip == addrLocalHost.ip || !addrConnect.IsIPv4() || FindNode(addrConnect.ip))
-                        continue;
-
-                    CNode* pnode = ConnectNode(addrConnect);
-                    if (!pnode)
-                        continue;
-                    pnode->fNetworkNode = true;
-
                     // Advertise our address
                     vector<CAddress> vAddrToSend;
                     vAddrToSend.push_back(addrLocalHost);
                     pnode->PushMessage("addr", vAddrToSend);
-
-                    // Get as many addresses as we can
-                    pnode->PushMessage("getaddr");
-
-                    ////// should the one on the receiving end do this too?
-                    // Subscribe our local subscription list
-                    const unsigned int nHops = 0;
-                    for (unsigned int nChannel = 0; nChannel < pnodeLocalHost->vfSubscribe.size(); nChannel++)
-                        if (pnodeLocalHost->vfSubscribe[nChannel])
-                            pnode->PushMessage("subscribe", nChannel, nHops);
-
-                    fSuccess = true;
-                    break;
                 }
+
+                // Get as many addresses as we can
+                pnode->PushMessage("getaddr");
+
+                ////// should the one on the receiving end do this too?
+                // Subscribe our local subscription list
+                const unsigned int nHops = 0;
+                for (unsigned int nChannel = 0; nChannel < pnodeLocalHost->vfSubscribe.size(); nChannel++)
+                    if (pnodeLocalHost->vfSubscribe[nChannel])
+                        pnode->PushMessage("subscribe", nChannel, nHops);
+
+                fSuccess = true;
+                break;
             }
-
-            nTries++;
         }
-
-        // Wait
-        vfThreadRunning[1] = false;
-        Sleep(100 + nTries * 5);
-        vfThreadRunning[1] = true;
-        CheckForShutdown(1);
     }
 }
 
@@ -668,6 +816,7 @@ void ThreadMessageHandler(void* parg)
 void ThreadMessageHandler2(void* parg)
 {
     printf("ThreadMessageHandler started\n");
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     loop
     {
         // Poll the connected nodes for messages
@@ -691,7 +840,7 @@ void ThreadMessageHandler2(void* parg)
 
         // Wait and allow messages to bunch up
         vfThreadRunning[2] = false;
-        Sleep(200);
+        Sleep(100);
         vfThreadRunning[2] = true;
         CheckForShutdown(2);
     }
@@ -733,7 +882,6 @@ bool StartNode(string& strError)
 {
     strError = "";
 
-
     // Sockets startup
     WSADATA wsadata;
     int ret = WSAStartup(MAKEWORD(2,2), &wsadata);
@@ -773,7 +921,7 @@ bool StartNode(string& strError)
         return false;
     }
 
-    // Set to nonblocking, incomming connections will also inherit this
+    // Set to nonblocking, incoming connections will also inherit this
     u_long nOne = 1;
     if (ioctlsocket(hListenSocket, FIONBIO, &nOne) == SOCKET_ERROR)
     {
@@ -785,10 +933,7 @@ bool StartNode(string& strError)
     // The sockaddr_in structure specifies the address family,
     // IP address, and port for the socket that is being bound
     int nRetryLimit = 15;
-    struct sockaddr_in sockaddr;
-    sockaddr.sin_family = AF_INET;
-    sockaddr.sin_addr.s_addr = addrLocalHost.ip;
-    sockaddr.sin_port = addrLocalHost.port;
+    struct sockaddr_in sockaddr = addrLocalHost.GetSockAddr();
     if (bind(hListenSocket, (struct sockaddr*)&sockaddr, sizeof(sockaddr)) == SOCKET_ERROR)
     {
         int nErr = WSAGetLastError();
@@ -809,6 +954,19 @@ bool StartNode(string& strError)
         return false;
     }
 
+    // Get our external IP address for incoming connections
+    if (addrIncoming.ip)
+        addrLocalHost.ip = addrIncoming.ip;
+
+    if (GetMyExternalIP(addrLocalHost.ip))
+    {
+        addrIncoming = addrLocalHost;
+        CWalletDB().WriteSetting("addrIncoming", addrIncoming);
+    }
+
+    // Get addresses from IRC and advertise ours
+    if (_beginthread(ThreadIRCSeed, 0, NULL) == -1)
+        printf("Error: _beginthread(ThreadIRCSeed) failed\n");
 
     //
     // Start threads

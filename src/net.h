@@ -1,22 +1,6 @@
-// Copyright (c) 2008 Satoshi Nakamoto
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in
-// all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE, TITLE AND NON-INFRINGEMENT. IN NO EVENT
-// SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
-// OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-// IN THE SOFTWARE.
+// Copyright (c) 2009 Satoshi Nakamoto
+// Distributed under the MIT/X11 software license, see the accompanying
+// file license.txt or http://www.opensource.org/licenses/mit-license.php.
 
 class CMessageHeader;
 class CAddress;
@@ -26,8 +10,8 @@ class CNode;
 
 
 
-static const unsigned short DEFAULT_PORT = htons(2222);
-static const unsigned int BROADCAST_HOPS = 5;
+static const unsigned short DEFAULT_PORT = htons(8333);
+static const unsigned int PUBLISH_HOPS = 5;
 enum
 {
     NODE_NETWORK = (1 << 0),
@@ -38,7 +22,8 @@ enum
 
 
 
-
+bool ConnectSocket(const CAddress& addrConnect, SOCKET& hSocketRet);
+bool GetMyExternalIP(unsigned int& ipRet);
 bool AddAddress(CAddrDB& addrdb, const CAddress& addr);
 CNode* FindNode(unsigned int ip);
 CNode* ConnectNode(CAddress addrConnect, int64 nTimeout=0);
@@ -142,7 +127,6 @@ public:
 
 
 
-
 static const unsigned char pchIPv4[12] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
 
 class CAddress
@@ -156,6 +140,9 @@ public:
     // disk only
     unsigned int nTime;
 
+    // memory only
+    unsigned int nLastFailed;
+
     CAddress()
     {
         nServices = 0;
@@ -163,6 +150,7 @@ public:
         ip = 0;
         port = DEFAULT_PORT;
         nTime = GetAdjustedTime();
+        nLastFailed = 0;
     }
 
     CAddress(unsigned int ipIn, unsigned short portIn, uint64 nServicesIn=0)
@@ -172,6 +160,17 @@ public:
         ip = ipIn;
         port = portIn;
         nTime = GetAdjustedTime();
+        nLastFailed = 0;
+    }
+
+    explicit CAddress(const struct sockaddr_in& sockaddr, uint64 nServicesIn=0)
+    {
+        nServices = nServicesIn;
+        memcpy(pchReserved, pchIPv4, sizeof(pchReserved));
+        ip = sockaddr.sin_addr.s_addr;
+        port = sockaddr.sin_port;
+        nTime = GetAdjustedTime();
+        nLastFailed = 0;
     }
 
     explicit CAddress(const char* pszIn, uint64 nServicesIn=0)
@@ -181,6 +180,7 @@ public:
         ip = 0;
         port = DEFAULT_PORT;
         nTime = GetAdjustedTime();
+        nLastFailed = 0;
 
         char psz[100];
         if (strlen(pszIn) > ARRAYLEN(psz)-1)
@@ -236,8 +236,23 @@ public:
     vector<unsigned char> GetKey() const
     {
         CDataStream ss;
+        ss.reserve(18);
         ss << FLATDATA(pchReserved) << ip << port;
+
+        #if defined(_MSC_VER) && _MSC_VER < 1300
         return vector<unsigned char>((unsigned char*)&ss.begin()[0], (unsigned char*)&ss.end()[0]);
+        #else
+        return vector<unsigned char>(ss.begin(), ss.end());
+        #endif
+    }
+
+    struct sockaddr_in GetSockAddr() const
+    {
+        struct sockaddr_in sockaddr;
+        sockaddr.sin_family = AF_INET;
+        sockaddr.sin_addr.s_addr = ip;
+        sockaddr.sin_port = port;
+        return sockaddr;
     }
 
     bool IsIPv4() const
@@ -245,14 +260,30 @@ public:
         return (memcmp(pchReserved, pchIPv4, sizeof(pchIPv4)) == 0);
     }
 
+    bool IsRoutable() const
+    {
+        return !(GetByte(3) == 10 || (GetByte(3) == 192 && GetByte(2) == 168));
+    }
+
     unsigned char GetByte(int n) const
     {
         return ((unsigned char*)&ip)[3-n];
     }
 
+    string ToStringIPPort() const
+    {
+        return strprintf("%u.%u.%u.%u:%u", GetByte(3), GetByte(2), GetByte(1), GetByte(0), ntohs(port));
+    }
+
+    string ToStringIP() const
+    {
+        return strprintf("%u.%u.%u.%u", GetByte(3), GetByte(2), GetByte(1), GetByte(0));
+    }
+
     string ToString() const
     {
         return strprintf("%u.%u.%u.%u:%u", GetByte(3), GetByte(2), GetByte(1), GetByte(0), ntohs(port));
+        //return strprintf("%u.%u.%u.%u", GetByte(3), GetByte(2), GetByte(1), GetByte(0));
     }
 
     void print() const
@@ -345,7 +376,7 @@ public:
 
     string ToString() const
     {
-        return strprintf("%s %s", GetCommand(), hash.ToString().substr(0,6).c_str());
+        return strprintf("%s %s", GetCommand(), hash.ToString().substr(0,14).c_str());
     }
 
     void print() const
@@ -394,6 +425,7 @@ extern map<CInv, CDataStream> mapRelay;
 extern deque<pair<int64, CInv> > vRelayExpiration;
 extern CCriticalSection cs_mapRelay;
 extern map<CInv, int64> mapAlreadyAskedFor;
+extern CAddress addrProxy;
 
 
 
@@ -428,16 +460,17 @@ public:
     set<CAddress> setAddrKnown;
 
     // inventory based relay
-    vector<CInv> vInventoryToSend;
     set<CInv> setInventoryKnown;
+    set<CInv> setInventoryKnown2;
+    vector<CInv> vInventoryToSend;
     CCriticalSection cs_inventory;
     multimap<int64, CInv> mapAskFor;
 
-    // broadcast and subscription
+    // publish and subscription
     vector<char> vfSubscribe;
 
 
-    CNode(SOCKET hSocketIn, CAddress addrIn)
+    CNode(SOCKET hSocketIn, CAddress addrIn, bool fInboundIn=false)
     {
         nServices = 0;
         hSocket = hSocketIn;
@@ -447,7 +480,7 @@ public:
         addr = addrIn;
         nVersion = 0;
         fClient = false; // set by version message
-        fInbound = false;
+        fInbound = fInboundIn;
         fNetworkNode = false;
         fDisconnect = false;
         nRefCount = 0;
@@ -455,8 +488,9 @@ public:
         vfSubscribe.assign(256, false);
 
         // Push a version message
-        unsigned int nTime = GetAdjustedTime();
-        PushMessage("version", VERSION, nLocalServices, nTime);
+        /// when NTP implemented, change to just nTime = GetAdjustedTime()
+        int64 nTime = (fInbound ? GetAdjustedTime() : GetTime());
+        PushMessage("version", VERSION, nLocalServices, nTime, addr);
     }
 
     ~CNode()
@@ -502,13 +536,27 @@ public:
             setInventoryKnown.insert(inv);
     }
 
+    void PushInventory(const CInv& inv)
+    {
+        CRITICAL_BLOCK(cs_inventory)
+            if (!setInventoryKnown.count(inv))
+                vInventoryToSend.push_back(inv);
+    }
+
     void AskFor(const CInv& inv)
     {
         // We're using mapAskFor as a priority queue,
         // the key is the earliest time the request can be sent
         int64& nRequestTime = mapAlreadyAskedFor[inv];
         printf("askfor %s  %I64d\n", inv.ToString().c_str(), nRequestTime);
-        nRequestTime = max(nRequestTime + 2 * 60, GetTime());
+
+        // Make sure not to reuse time indexes to keep things in the same order
+        int64 nNow = (GetTime() - 1) * 1000000;
+        static int64 nLastTime;
+        nLastTime = nNow = max(nNow, ++nLastTime);
+
+        // Each retry is 2 minutes after the last
+        nRequestTime = max(nRequestTime + 2 * 60 * 1000000, nNow);
         mapAskFor.insert(make_pair(nRequestTime, inv));
     }
 
@@ -536,6 +584,14 @@ public:
 
     void EndMessage()
     {
+        extern int nDropMessagesTest;
+        if (nDropMessagesTest > 0 && GetRand(nDropMessagesTest) == 0)
+        {
+            printf("dropmessages DROPPING SEND MESSAGE\n");
+            AbortMessage();
+            return;
+        }
+
         if (nPushPos == -1)
             return;
 
@@ -712,15 +768,14 @@ inline void RelayInventory(const CInv& inv)
     // Put on lists to offer to the other nodes
     CRITICAL_BLOCK(cs_vNodes)
         foreach(CNode* pnode, vNodes)
-            CRITICAL_BLOCK(pnode->cs_inventory)
-                if (!pnode->setInventoryKnown.count(inv))
-                    pnode->vInventoryToSend.push_back(inv);
+            pnode->PushInventory(inv);
 }
 
 template<typename T>
 void RelayMessage(const CInv& inv, const T& a)
 {
     CDataStream ss(SER_NETWORK);
+    ss.reserve(10000);
     ss << a;
     RelayMessage(inv, ss);
 }
@@ -730,17 +785,72 @@ inline void RelayMessage<>(const CInv& inv, const CDataStream& ss)
 {
     CRITICAL_BLOCK(cs_mapRelay)
     {
-        // Save original serialized message so newer versions are preserved
-        mapRelay[inv] = ss;
-
         // Expire old relay messages
-        vRelayExpiration.push_back(make_pair(GetTime() + 10 * 60, inv));
         while (!vRelayExpiration.empty() && vRelayExpiration.front().first < GetTime())
         {
             mapRelay.erase(vRelayExpiration.front().second);
             vRelayExpiration.pop_front();
         }
+
+        // Save original serialized message so newer versions are preserved
+        mapRelay[inv] = ss;
+        vRelayExpiration.push_back(make_pair(GetTime() + 15 * 60, inv));
     }
 
     RelayInventory(inv);
+}
+
+
+
+
+
+
+
+
+//
+// Templates for the publish and subscription system.
+// The object being published as T& obj needs to have:
+//   a set<unsigned int> setSources member
+//   specializations of AdvertInsert and AdvertErase
+// Currently implemented for CTable and CProduct.
+//
+
+template<typename T>
+void AdvertStartPublish(CNode* pfrom, unsigned int nChannel, unsigned int nHops, T& obj)
+{
+    // Add to sources
+    obj.setSources.insert(pfrom->addr.ip);
+
+    if (!AdvertInsert(obj))
+        return;
+
+    // Relay
+    CRITICAL_BLOCK(cs_vNodes)
+        foreach(CNode* pnode, vNodes)
+            if (pnode != pfrom && (nHops < PUBLISH_HOPS || pnode->IsSubscribed(nChannel)))
+                pnode->PushMessage("publish", nChannel, nHops, obj);
+}
+
+template<typename T>
+void AdvertStopPublish(CNode* pfrom, unsigned int nChannel, unsigned int nHops, T& obj)
+{
+    uint256 hash = obj.GetHash();
+
+    CRITICAL_BLOCK(cs_vNodes)
+        foreach(CNode* pnode, vNodes)
+            if (pnode != pfrom && (nHops < PUBLISH_HOPS || pnode->IsSubscribed(nChannel)))
+                pnode->PushMessage("pub-cancel", nChannel, nHops, hash);
+
+    AdvertErase(obj);
+}
+
+template<typename T>
+void AdvertRemoveSource(CNode* pfrom, unsigned int nChannel, unsigned int nHops, T& obj)
+{
+    // Remove a source
+    obj.setSources.erase(pfrom->addr.ip);
+
+    // If no longer supported by any sources, cancel it
+    if (obj.setSources.empty())
+        AdvertStopPublish(pfrom, nChannel, nHops, obj);
 }
